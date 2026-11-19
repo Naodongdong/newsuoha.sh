@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="2.1.3"
+VERSION="2.1.4"
 APP="suoha-v2"
 BASE="/opt/suoha-v2"
 ETC="/etc/suoha-v2"
@@ -68,7 +68,7 @@ install_dependencies(){
     apt-get install -y --no-install-recommends bash ca-certificates curl wget tar gzip jq openssl python3 iproute2 procps coreutils util-linux dnsutils cron
   else
     apk update
-    apk add --no-cache bash ca-certificates curl wget tar gzip jq openssl python3 iproute2 procps coreutils util-linux bind-tools tzdata openrc dcron
+    apk add --no-cache bash ca-certificates curl wget tar gzip jq openssl python3 iproute2 procps coreutils util-linux bind-tools tzdata openrc dcron gcompat
   fi
   update-ca-certificates >/dev/null 2>&1 || true
   for c in bash curl tar jq openssl python3; do command_exists "$c" || die "依赖安装后仍缺少命令：$c"; done
@@ -141,33 +141,72 @@ get_public_ip(){
 issue_certificate(){
   local domain="$1"
   [[ -n "$domain" ]] || die "TLS 协议需要证书域名"
-  log "为 $domain 申请 Let's Encrypt 证书（HTTP-01，需要公网 TCP/80 可达，DNS 必须直连源站）..."
+  log "为 $domain 申请 Let's Encrypt 证书（Cloudflare DNS-01，无需开放公网 TCP/80）..."
 
-  # acme.sh 将程序目录与账户配置目录分开管理。必须显式固定两者，
-  # 否则 root 下会退回 /root/.acme.sh，造成安装目录与 account.conf 不一致。
+  # acme.sh 将程序目录与账户配置目录分开管理。
   mkdir -p "$ACME_HOME" "$ACME_CONFIG_HOME"
   chmod 700 "$ACME_HOME" "$ACME_CONFIG_HOME"
   local acme="$ACME_HOME/acme.sh"
   if [[ ! -x "$acme" ]]; then
-    curl -fsSL https://get.acme.sh | sh -s --home "$ACME_HOME" --config-home "$ACME_CONFIG_HOME"
+    # 直接使用官方 GitHub 源码包安装，避免 get.acme.sh 包装器把 --home
+    # 误传给 Alpine 的 BusyBox ash（旧版会报 sh: bad option '--home'）。
+    TMP_WORK="$(mktemp -d)"
+    local acme_archive="$TMP_WORK/acme.sh.tar.gz"
+    curl -fL --retry 3 --connect-timeout 15 \
+      https://github.com/acmesh-official/acme.sh/archive/refs/heads/master.tar.gz \
+      -o "$acme_archive"
+    tar -xzf "$acme_archive" -C "$TMP_WORK"
+    local acme_source="$TMP_WORK/acme.sh-master/acme.sh"
+    [[ -f "$acme_source" ]] || die "acme.sh 官方源码包解压失败"
+    (cd "$TMP_WORK/acme.sh-master" && sh ./acme.sh --install \
+      --home "$ACME_HOME" --config-home "$ACME_CONFIG_HOME" --no-cron --no-profile)
   fi
   [[ -x "$acme" ]] || die "acme.sh 安装失败：未找到 $acme"
 
-  # 显式指定 Let's Encrypt，并在每次调用时使用同一个 config-home。
-  # 若已有域名匹配且至少剩余 24 小时的有效 ECC 证书，则直接复用，
-  # 避免 acme.sh 因证书尚未到续期窗口而返回 Skipping / exit code 2。
   "$acme" --home "$ACME_HOME" --config-home "$ACME_CONFIG_HOME" --set-default-ca --server letsencrypt >/dev/null
+
   local existing_fullchain="$ACME_CONFIG_HOME/${domain}_ecc/fullchain.cer"
   local existing_key="$ACME_CONFIG_HOME/${domain}_ecc/${domain}.key"
+  local CF_Token=""
   if [[ -s "$existing_fullchain" && -s "$existing_key" ]] \
     && openssl x509 -in "$existing_fullchain" -noout -checkend 86400 >/dev/null 2>&1 \
     && openssl x509 -in "$existing_fullchain" -noout -checkhost "$domain" >/dev/null 2>&1; then
-    log "发现 $domain 的有效证书，直接复用，不重新申请。"
+    log "发现 $domain 的有效证书；仍需配置 Cloudflare Token，以确保后续自动续期。"
   else
-    log "没有发现有效证书，开始申请或续期..."
-    "$acme" --home "$ACME_HOME" --config-home "$ACME_CONFIG_HOME" \
-      --issue --server letsencrypt --standalone -d "$domain" --keylength ec-256 --httpport 80
+    log "Cloudflare DNS-01 验证需要 API Token。"
   fi
+
+  echo "请粘贴 Cloudflare API Token（输入不回显）。"
+  echo "所需权限：Zone / DNS / Edit + Zone / Zone / Read；资源范围仅选择 kdns.fr。"
+  read -r -s -p "Cloudflare API Token：" CF_Token
+  echo
+  [[ -n "$CF_Token" ]] || die "Cloudflare API Token 不能为空"
+
+  local token_check
+  token_check="$(curl -fsS --connect-timeout 10 --max-time 20 \
+    -H "Authorization: Bearer $CF_Token" \
+    -H 'Content-Type: application/json' \
+    https://api.cloudflare.com/client/v4/user/tokens/verify 2>/dev/null || true)"
+  echo "$token_check" | jq -e '.success == true and .result.status == "active"' >/dev/null 2>&1 \
+    || die "Cloudflare API Token 验证失败或已失效，请检查 Token 状态及权限"
+
+  export CF_Token
+  local -a issue_args=(--issue --server letsencrypt --dns dns_cf -d "$domain" --keylength ec-256)
+  if [[ -s "$existing_fullchain" && -s "$existing_key" ]] \
+    && openssl x509 -in "$existing_fullchain" -noout -checkend 86400 >/dev/null 2>&1 \
+    && openssl x509 -in "$existing_fullchain" -noout -checkhost "$domain" >/dev/null 2>&1; then
+    log "发现现有有效证书，检查 acme.sh 是否已保存 DNS API 凭证..."
+    # 若旧证书来自 HTTP-01，强制本次通过 DNS-01 重新签发一次，确保
+    # acme.sh 将 Cloudflare Token 安全保存到 account.conf，供自动续期使用。
+    if ! grep -q '^SAVED_CF_Token=' "$ACME_CONFIG_HOME/account.conf" 2>/dev/null; then
+      issue_args+=(--force)
+    fi
+  fi
+  log "开始通过 Cloudflare DNS API 创建 TXT 记录并申请/检查证书..."
+  "$acme" --home "$ACME_HOME" --config-home "$ACME_CONFIG_HOME" "${issue_args[@]}"
+  unset CF_Token
+
+  chmod 600 "$ACME_CONFIG_HOME/account.conf" 2>/dev/null || true
   mkdir -p "$CERT_DIR"
   "$acme" --home "$ACME_HOME" --config-home "$ACME_CONFIG_HOME" \
     --install-cert -d "$domain" --ecc \
@@ -181,7 +220,6 @@ issue_certificate(){
      echo "17 3 * * * $acme --home $ACME_HOME --config-home $ACME_CONFIG_HOME --cron >/dev/null 2>&1 && (systemctl restart suoha-v2 2>/dev/null || rc-service suoha-v2 restart 2>/dev/null || true) # suoha-v2-acme-renew") | crontab -
   fi
 }
-
 make_credentials(){
   mkdir -p "$ETC" "$CERT_DIR" "$SUB_DIR"
   chmod 700 "$ETC" "$CERT_DIR" "$SUB_DIR"
