@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="2.1.2"
+VERSION="2.1.3"
 APP="suoha-v2"
 BASE="/opt/suoha-v2"
 ETC="/etc/suoha-v2"
@@ -276,9 +276,14 @@ ask_config(){
   ARGO_VLESS_PATH="/vl-$(rand_hex 8)"
   ARGO_TROJAN_PATH="/tr-$(rand_hex 8)"
   ARGO_VMESS_PATH="/vm-$(rand_hex 8)"
+  TUNNEL_NAME=""
   if [[ "$TUNNEL_MODE" != 1 ]]; then
     ARGO_ENABLED=1
     if [[ "$TUNNEL_MODE" == 3 ]]; then
+      local default_tunnel_name="suoha-v2"
+      read -r -p "Cloudflare Named Tunnel 名称 [默认 ${default_tunnel_name}]：" TUNNEL_NAME
+      TUNNEL_NAME="${TUNNEL_NAME:-$default_tunnel_name}"
+      [[ "$TUNNEL_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,62}[A-Za-z0-9]$|^[A-Za-z0-9]$ ]] || die "Tunnel 名称仅允许英文字母、数字和短横线，长度 1-64 位，且不能以短横线开头或结尾"
       read -r -p "Cloudflare 订阅域名（例如 sub.example.com）：" SUB_DOMAIN
       valid_domain "$SUB_DOMAIN" || die "订阅域名格式不正确"
       read -r -p "Argo 节点域名（可与订阅域名相同，默认相同）：" ARGO_DOMAIN
@@ -356,6 +361,7 @@ P_ANYTLS='$P_ANYTLS'
 P_SNELL='$P_SNELL'
 P_TROJAN='$P_TROJAN'
 TUNNEL_MODE='$TUNNEL_MODE'
+TUNNEL_NAME='${TUNNEL_NAME:-}'
 NAME_PREFIX='${NAME_PREFIX:-}'
 SUB_PORT='$SUB_PORT'
 SUB_TOKEN='$SUB_TOKEN'
@@ -900,17 +906,31 @@ EOF_QR
   else
     log "Named Tunnel：需要交互式 Cloudflare 授权。"
     cloudflared tunnel login
-    local name="suoha-v2"
-    if ! cloudflared tunnel list | awk 'NR>1{print $2}' | grep -Fxq "$name"; then cloudflared tunnel create "$name"; fi
-    local tid; tid="$(cloudflared tunnel list | awk -v n="$name" '$2==n{print $1;exit}')"
-    [[ -n "$tid" ]] || die "无法找到 Named Tunnel ID"
+    # 从安装配置读取用户选择的名称；旧配置缺少该字段时兼容默认名称。
+    local name="${TUNNEL_NAME:-suoha-v2}"
+    local tunnel_list tid credentials_file
+    tunnel_list="$(cloudflared tunnel list 2>/dev/null)" || die "无法读取 Cloudflare Tunnel 列表，请检查 Cloudflare 授权状态"
+    tid="$(printf '%s\n' "$tunnel_list" | awk -v n="$name" '$2==n{print $1;exit}')"
+    if [[ -z "$tid" ]]; then
+      log "未发现名为 $name 的 Tunnel，正在创建..."
+      cloudflared tunnel create "$name"
+      tunnel_list="$(cloudflared tunnel list 2>/dev/null)" || die "Tunnel 创建后无法读取列表"
+      tid="$(printf '%s\n' "$tunnel_list" | awk -v n="$name" '$2==n{print $1;exit}')"
+    else
+      log "发现 Cloudflare Tunnel：$name（$tid）"
+    fi
+    [[ -n "$tid" ]] || die "无法找到或创建 Named Tunnel：$name"
+    mkdir -p /root/.cloudflared
+    credentials_file="/root/.cloudflared/$tid.json"
+    if [[ ! -s "$credentials_file" ]]; then
+      die "Cloudflare 账户中已存在 Tunnel '$name'，但本机缺少凭证文件 $credentials_file。为避免误用其他 VPS 的 Tunnel，请返回安装配置并输入一个新的唯一 Tunnel 名称（例如 suoha-v2-dmit-01），或将原 Tunnel 凭证安全迁移到本机后重试。"
+    fi
     cloudflared tunnel route dns "$name" "$SUB_DOMAIN"
     if [[ "$ARGO_DOMAIN" != "$SUB_DOMAIN" ]]; then cloudflared tunnel route dns "$name" "$ARGO_DOMAIN"; fi
-    mkdir -p /root/.cloudflared
-      if [[ "$ARGO_DOMAIN" == "$SUB_DOMAIN" ]]; then
+    if [[ "$ARGO_DOMAIN" == "$SUB_DOMAIN" ]]; then
       cat > "$ETC/cloudflared.yml" <<EOF_CF
  tunnel: $tid
- credentials-file: /root/.cloudflared/$tid.json
+ credentials-file: $credentials_file
  ingress:
    - hostname: $SUB_DOMAIN
      service: http://127.0.0.1:$ARGO_ROUTER_PORT
@@ -919,7 +939,7 @@ EOF_CF
     else
       cat > "$ETC/cloudflared.yml" <<EOF_CF
  tunnel: $tid
- credentials-file: /root/.cloudflared/$tid.json
+ credentials-file: $credentials_file
  ingress:
    - hostname: $SUB_DOMAIN
      service: http://127.0.0.1:$ARGO_ROUTER_PORT
@@ -1027,6 +1047,7 @@ show_info(){
   echo "========== Suoha V2 部署信息 =========="
   echo "sing-box: $(sing-box version | head -n1)"
   echo "Proxy host: $NODE_HOST"
+  [[ "$TUNNEL_MODE" == 3 ]] && echo "Cloudflare Tunnel: ${TUNNEL_NAME:-suoha-v2}"
   echo "VLESS Reality Vision TCP: $P_REALITY"
   echo "VLESS Reality gRPC TCP: $P_REALITY_GRPC"
   echo "Snell TCP: $P_SNELL"
