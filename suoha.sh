@@ -4,10 +4,12 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="2.1.0"
+VERSION="2.1.2"
 APP="suoha-v2"
 BASE="/opt/suoha-v2"
 ETC="/etc/suoha-v2"
+ACME_HOME="$ETC/acme"
+ACME_CONFIG_HOME="$ETC/acme-config"
 CERT_DIR="$ETC/cert"
 LOG_DIR="/var/log/suoha-v2"
 LOG_FILE="$LOG_DIR/install.log"
@@ -140,15 +142,35 @@ issue_certificate(){
   local domain="$1"
   [[ -n "$domain" ]] || die "TLS 协议需要证书域名"
   log "为 $domain 申请 Let's Encrypt 证书（HTTP-01，需要公网 TCP/80 可达，DNS 必须直连源站）..."
-  if ! command_exists acme.sh; then
-    curl -fsSL https://get.acme.sh | sh -s email="admin@${domain#*.}" --home "$ETC/acme"
+
+  # acme.sh 将程序目录与账户配置目录分开管理。必须显式固定两者，
+  # 否则 root 下会退回 /root/.acme.sh，造成安装目录与 account.conf 不一致。
+  mkdir -p "$ACME_HOME" "$ACME_CONFIG_HOME"
+  chmod 700 "$ACME_HOME" "$ACME_CONFIG_HOME"
+  local acme="$ACME_HOME/acme.sh"
+  if [[ ! -x "$acme" ]]; then
+    curl -fsSL https://get.acme.sh | sh -s --home "$ACME_HOME" --config-home "$ACME_CONFIG_HOME"
   fi
-  local acme="$ETC/acme/acme.sh"
-  [[ -x "$acme" ]] || die "acme.sh 安装失败"
-  "$acme" --set-default-ca --server letsencrypt >/dev/null
-  "$acme" --issue --standalone -d "$domain" --keylength ec-256 --httpport 80
+  [[ -x "$acme" ]] || die "acme.sh 安装失败：未找到 $acme"
+
+  # 显式指定 Let's Encrypt，并在每次调用时使用同一个 config-home。
+  # 若已有域名匹配且至少剩余 24 小时的有效 ECC 证书，则直接复用，
+  # 避免 acme.sh 因证书尚未到续期窗口而返回 Skipping / exit code 2。
+  "$acme" --home "$ACME_HOME" --config-home "$ACME_CONFIG_HOME" --set-default-ca --server letsencrypt >/dev/null
+  local existing_fullchain="$ACME_CONFIG_HOME/${domain}_ecc/fullchain.cer"
+  local existing_key="$ACME_CONFIG_HOME/${domain}_ecc/${domain}.key"
+  if [[ -s "$existing_fullchain" && -s "$existing_key" ]] \
+    && openssl x509 -in "$existing_fullchain" -noout -checkend 86400 >/dev/null 2>&1 \
+    && openssl x509 -in "$existing_fullchain" -noout -checkhost "$domain" >/dev/null 2>&1; then
+    log "发现 $domain 的有效证书，直接复用，不重新申请。"
+  else
+    log "没有发现有效证书，开始申请或续期..."
+    "$acme" --home "$ACME_HOME" --config-home "$ACME_CONFIG_HOME" \
+      --issue --server letsencrypt --standalone -d "$domain" --keylength ec-256 --httpport 80
+  fi
   mkdir -p "$CERT_DIR"
-  "$acme" --install-cert -d "$domain" --ecc \
+  "$acme" --home "$ACME_HOME" --config-home "$ACME_CONFIG_HOME" \
+    --install-cert -d "$domain" --ecc \
     --key-file "$CERT_DIR/key.pem" \
     --fullchain-file "$CERT_DIR/cert.pem" \
     --reloadcmd "$(command -v true)"
@@ -156,7 +178,7 @@ issue_certificate(){
   [[ -s "$CERT_DIR/key.pem" && -s "$CERT_DIR/cert.pem" ]] || die "证书文件不存在或为空"
   if command_exists crontab; then
     (crontab -l 2>/dev/null | grep -v 'suoha-v2-acme-renew' || true
-     echo "17 3 * * * $acme --cron --home $ETC/acme >/dev/null 2>&1 && (systemctl restart suoha-v2 2>/dev/null || rc-service suoha-v2 restart 2>/dev/null || true) # suoha-v2-acme-renew") | crontab -
+     echo "17 3 * * * $acme --home $ACME_HOME --config-home $ACME_CONFIG_HOME --cron >/dev/null 2>&1 && (systemctl restart suoha-v2 2>/dev/null || rc-service suoha-v2 restart 2>/dev/null || true) # suoha-v2-acme-renew") | crontab -
   fi
 }
 
@@ -208,6 +230,14 @@ ask_config(){
   echo "  3) Cloudflare Named Tunnel：发布订阅 + Argo WebSocket 节点（自定义域名）"
   read -r -p "选择 [1-3，默认 1]：" TUNNEL_MODE; TUNNEL_MODE="${TUNNEL_MODE:-1}"
   [[ "$TUNNEL_MODE" =~ ^[123]$ ]] || die "无效的模式选择"
+
+  local default_prefix=""
+  if [[ -f "$ETC/settings.env" ]]; then
+    default_prefix="$(. "$ETC/settings.env"; printf '%s' "${NAME_PREFIX:-}")"
+  fi
+  read -r -p "节点名称统一前缀（如 DMIT-，留空不添加，默认 ${default_prefix:-无}）[${default_prefix}]：" NAME_PREFIX
+  NAME_PREFIX="${NAME_PREFIX:-$default_prefix}"
+  [[ "$NAME_PREFIX" =~ ^[A-Za-z0-9_.-]{0,24}$ ]] || die "前缀仅允许英文字母、数字、点、下划线和短横线，最多 24 位"
 
   read -r -p "代理连接域名（建议 DNS only，A/AAAA 指向本机；留空则仅 Reality/Snell 用 IP）：" PROXY_DOMAIN
   if [[ -n "$PROXY_DOMAIN" ]]; then valid_domain "$PROXY_DOMAIN" || die "域名格式不正确"; fi
@@ -326,6 +356,7 @@ P_ANYTLS='$P_ANYTLS'
 P_SNELL='$P_SNELL'
 P_TROJAN='$P_TROJAN'
 TUNNEL_MODE='$TUNNEL_MODE'
+NAME_PREFIX='${NAME_PREFIX:-}'
 SUB_PORT='$SUB_PORT'
 SUB_TOKEN='$SUB_TOKEN'
 SUB_TLS='$SUB_TLS'
@@ -349,6 +380,7 @@ EOF_SETTINGS
 write_subscription(){
   # shellcheck disable=SC1090
   source "$CREDENTIALS"; source "$ETC/settings.env"
+  NAME_PREFIX="${NAME_PREFIX:-}"
   local host="$NODE_HOST" enc_host="$NODE_HOST" lines="" vmess_json vmess_b64 ss_auth ss_b64
   local server label n1 n2 n3
   local all_names=() argo_names=() servers=() opt opt_array=()
@@ -366,8 +398,8 @@ proxies:
 EOF_CLASH_BASE
 
   # Direct VLESS Reality Vision
-  lines+="vless://${UUID}@${enc_host}:${P_REALITY}?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SID}&type=tcp&flow=xtls-rprx-vision#Suoha-VLESS-Reality-Vision\\n"
-  n1="Suoha-VLESS-Reality-Vision"; all_names+=("$n1")
+  lines+="vless://${UUID}@${enc_host}:${P_REALITY}?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SID}&type=tcp&flow=xtls-rprx-vision#${NAME_PREFIX}Suoha-VLESS-Reality-Vision\\n"
+  n1="${NAME_PREFIX}Suoha-VLESS-Reality-Vision"; all_names+=("$n1")
   cat >> "$SUB_DIR/clash.yaml" <<EOF_CLASH_DIRECT
   - name: "$n1"
     type: vless
@@ -386,8 +418,8 @@ EOF_CLASH_BASE
 EOF_CLASH_DIRECT
 
   # Direct VLESS Reality gRPC
-  lines+="vless://${UUID}@${enc_host}:${P_REALITY_GRPC}?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SID}&type=grpc&serviceName=${REALITY_GRPC_SERVICE}#Suoha-VLESS-Reality-gRPC\\n"
-  n1="Suoha-VLESS-Reality-gRPC"; all_names+=("$n1")
+  lines+="vless://${UUID}@${enc_host}:${P_REALITY_GRPC}?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SID}&type=grpc&serviceName=${REALITY_GRPC_SERVICE}#${NAME_PREFIX}Suoha-VLESS-Reality-gRPC\\n"
+  n1="${NAME_PREFIX}Suoha-VLESS-Reality-gRPC"; all_names+=("$n1")
   cat >> "$SUB_DIR/clash.yaml" <<EOF_CLASH_DIRECT
   - name: "$n1"
     type: vless
@@ -408,8 +440,8 @@ EOF_CLASH_DIRECT
 
   # Snell direct: sing-box server v5 is wire-compatible with client v4 (QUIC mode is not used).
   if [[ "$PUBLIC4" != 127.* && -n "$PUBLIC4" ]]; then
-    lines+="snell://${SNELL_PSK}@${PUBLIC4}:${P_SNELL}?version=4&obfs=http#Suoha-Snell-IPv4\\n"
-    n1="Suoha-Snell-IPv4"; all_names+=("$n1")
+    lines+="snell://${SNELL_PSK}@${PUBLIC4}:${P_SNELL}?version=4&obfs=http#${NAME_PREFIX}Suoha-Snell-IPv4\\n"
+    n1="${NAME_PREFIX}Suoha-Snell-IPv4"; all_names+=("$n1")
     cat >> "$SUB_DIR/clash.yaml" <<EOF_CLASH_DIRECT
   - name: "$n1"
     type: snell
@@ -422,8 +454,8 @@ EOF_CLASH_DIRECT
     printf '%s = snell, %s, %s, psk=%s, version=4, reuse=true\n' "$n1" "$PUBLIC4" "$P_SNELL" "$SNELL_PSK" >> "$SUB_DIR/surge.conf"
   fi
   if [[ -n "$PUBLIC6" ]]; then
-    lines+="snell://${SNELL_PSK}@[${PUBLIC6}]:${P_SNELL}?version=4&obfs=http#Suoha-Snell-IPv6\\n"
-    n1="Suoha-Snell-IPv6"; all_names+=("$n1")
+    lines+="snell://${SNELL_PSK}@[${PUBLIC6}]:${P_SNELL}?version=4&obfs=http#${NAME_PREFIX}Suoha-Snell-IPv6\\n"
+    n1="${NAME_PREFIX}Suoha-Snell-IPv6"; all_names+=("$n1")
     cat >> "$SUB_DIR/clash.yaml" <<EOF_CLASH_DIRECT
   - name: "$n1"
     type: snell
@@ -436,8 +468,8 @@ EOF_CLASH_DIRECT
     printf '%s = snell, [%s], %s, psk=%s, version=4, reuse=true\n' "$n1" "$PUBLIC6" "$P_SNELL" "$SNELL_PSK" >> "$SUB_DIR/surge.conf"
     ss_auth="aes-128-gcm:${SS6_PASSWORD}"
     ss_b64="$(printf '%s' "$ss_auth" | base64 | tr -d '\n')"
-    lines+="ss://${ss_b64}@[${PUBLIC6}]:${P_SS6}#Suoha-SS-IPv6\\n"
-    n1="Suoha-SS-IPv6"; all_names+=("$n1")
+    lines+="ss://${ss_b64}@[${PUBLIC6}]:${P_SS6}#${NAME_PREFIX}Suoha-SS-IPv6\\n"
+    n1="${NAME_PREFIX}Suoha-SS-IPv6"; all_names+=("$n1")
     cat >> "$SUB_DIR/clash.yaml" <<EOF_CLASH_DIRECT
   - name: "$n1"
     type: ss
@@ -450,8 +482,8 @@ EOF_CLASH_DIRECT
   fi
 
   if [[ -n "$PROXY_DOMAIN" ]]; then
-    lines+="hysteria2://${HY2_PASS}@${PROXY_DOMAIN}:${P_HY2}?sni=${PROXY_DOMAIN}&obfs=salamander&obfs-password=${HY2_OBFS}#Suoha-Hysteria2\\n"
-    n1="Suoha-Hysteria2"; all_names+=("$n1")
+    lines+="hysteria2://${HY2_PASS}@${PROXY_DOMAIN}:${P_HY2}?sni=${PROXY_DOMAIN}&obfs=salamander&obfs-password=${HY2_OBFS}#${NAME_PREFIX}Suoha-Hysteria2\\n"
+    n1="${NAME_PREFIX}Suoha-Hysteria2"; all_names+=("$n1")
     cat >> "$SUB_DIR/clash.yaml" <<EOF_CLASH_DIRECT
   - name: "$n1"
     type: hysteria2
@@ -462,8 +494,8 @@ EOF_CLASH_DIRECT
     obfs: salamander
     obfs-password: "$HY2_OBFS"
 EOF_CLASH_DIRECT
-    lines+="tuic://${TUIC_UUID}:${TUIC_PASS}@${PROXY_DOMAIN}:${P_TUIC}?congestion_control=bbr&udp_relay_mode=native&sni=${PROXY_DOMAIN}&alpn=h3#Suoha-TUIC\\n"
-    n1="Suoha-TUIC"; all_names+=("$n1")
+    lines+="tuic://${TUIC_UUID}:${TUIC_PASS}@${PROXY_DOMAIN}:${P_TUIC}?congestion_control=bbr&udp_relay_mode=native&sni=${PROXY_DOMAIN}&alpn=h3#${NAME_PREFIX}Suoha-TUIC\\n"
+    n1="${NAME_PREFIX}Suoha-TUIC"; all_names+=("$n1")
     cat >> "$SUB_DIR/clash.yaml" <<EOF_CLASH_DIRECT
   - name: "$n1"
     type: tuic
@@ -476,8 +508,8 @@ EOF_CLASH_DIRECT
     sni: "$PROXY_DOMAIN"
     alpn: [h3]
 EOF_CLASH_DIRECT
-    lines+="anytls://${ANYTLS_PASS}@${PROXY_DOMAIN}:${P_ANYTLS}?sni=${PROXY_DOMAIN}&insecure=0#Suoha-AnyTLS\\n"
-    n1="Suoha-AnyTLS"; all_names+=("$n1")
+    lines+="anytls://${ANYTLS_PASS}@${PROXY_DOMAIN}:${P_ANYTLS}?sni=${PROXY_DOMAIN}&insecure=0#${NAME_PREFIX}Suoha-AnyTLS\\n"
+    n1="${NAME_PREFIX}Suoha-AnyTLS"; all_names+=("$n1")
     cat >> "$SUB_DIR/clash.yaml" <<EOF_CLASH_DIRECT
   - name: "$n1"
     type: anytls
@@ -486,8 +518,8 @@ EOF_CLASH_DIRECT
     password: "$ANYTLS_PASS"
     sni: "$PROXY_DOMAIN"
 EOF_CLASH_DIRECT
-    lines+="trojan://${TROJAN_PASS}@${PROXY_DOMAIN}:${P_TROJAN}?security=tls&sni=${PROXY_DOMAIN}&type=tcp#Suoha-Trojan-TLS\\n"
-    n1="Suoha-Trojan-TLS"; all_names+=("$n1")
+    lines+="trojan://${TROJAN_PASS}@${PROXY_DOMAIN}:${P_TROJAN}?security=tls&sni=${PROXY_DOMAIN}&type=tcp#${NAME_PREFIX}Suoha-Trojan-TLS\\n"
+    n1="${NAME_PREFIX}Suoha-Trojan-TLS"; all_names+=("$n1")
     cat >> "$SUB_DIR/clash.yaml" <<EOF_CLASH_DIRECT
   - name: "$n1"
     type: trojan
@@ -510,7 +542,7 @@ EOF_CLASH_DIRECT
     done
     for server in "${servers[@]}"; do
       if [[ "$server" == "$ARGO_HOST" ]]; then label="Default"; else label="CF-${server}"; fi
-      n1="Suoha-VLESS-Argo-${label}"; n2="Suoha-Trojan-Argo-${label}"; n3="Suoha-VMess-Argo-${label}"
+      n1="${NAME_PREFIX}Suoha-VLESS-Argo-${label}"; n2="${NAME_PREFIX}Suoha-Trojan-Argo-${label}"; n3="${NAME_PREFIX}Suoha-VMess-Argo-${label}"
       all_names+=("$n1" "$n2" "$n3"); argo_names+=("$n1" "$n2" "$n3")
       lines+="vless://${UUID}@${server}:443?encryption=none&security=tls&sni=${ARGO_HOST}&type=ws&host=${ARGO_HOST}&path=%2F${ARGO_VLESS_PATH#/}#${n1}\\n"
       lines+="trojan://${TROJAN_PASS}@${server}:443?security=tls&sni=${ARGO_HOST}&type=ws&host=${ARGO_HOST}&path=%2F${ARGO_TROJAN_PATH#/}#${n2}\\n"
@@ -1048,6 +1080,21 @@ uninstall_all(){
   echo "卸载完成。备份位置：$backup。cloudflared 和 sing-box 二进制及系统依赖保留，避免误删其他服务共用组件。"
 }
 
+set_prefix(){
+  require_root
+  [[ -f "$ETC/settings.env" && -f "$CREDENTIALS" ]] || die "尚未安装 Suoha V2"
+  local new_prefix="${1:-}"
+  [[ "$new_prefix" =~ ^[A-Za-z0-9_.-]{0,24}$ ]] || die "前缀仅允许英文字母、数字、点、下划线和短横线，最多 24 位"
+  if grep -q '^NAME_PREFIX=' "$ETC/settings.env"; then
+    sed -i "s/^NAME_PREFIX=.*/NAME_PREFIX='$new_prefix'/" "$ETC/settings.env"
+  else
+    printf "\nNAME_PREFIX='%s'\n" "$new_prefix" >> "$ETC/settings.env"
+  fi
+  chmod 600 "$ETC/settings.env"
+  refresh_all
+  log "节点名称前缀已更新为：${new_prefix:-（空）}"
+}
+
 main(){
   local action="${1:-install}"
   case "$action" in
@@ -1055,8 +1102,9 @@ main(){
     upgrade) upgrade_all ;;
     status) status_all ;;
     refresh) refresh_all ;;
+    prefix) set_prefix "${2:-}" ;;
     uninstall) uninstall_all ;;
-    *) echo "用法：$0 [install|upgrade|status|refresh|uninstall]"; exit 2 ;;
+    *) echo "用法：$0 [install|upgrade|status|refresh|prefix <前缀>|uninstall]"; exit 2 ;;
   esac
 }
 main "$@"
