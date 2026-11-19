@@ -4,10 +4,12 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="2.1.0"
+VERSION="2.1.1"
 APP="suoha-v2"
 BASE="/opt/suoha-v2"
 ETC="/etc/suoha-v2"
+ACME_HOME="$ETC/acme"
+ACME_CONFIG_HOME="$ETC/acme-config"
 CERT_DIR="$ETC/cert"
 LOG_DIR="/var/log/suoha-v2"
 LOG_FILE="$LOG_DIR/install.log"
@@ -140,15 +142,25 @@ issue_certificate(){
   local domain="$1"
   [[ -n "$domain" ]] || die "TLS 协议需要证书域名"
   log "为 $domain 申请 Let's Encrypt 证书（HTTP-01，需要公网 TCP/80 可达，DNS 必须直连源站）..."
-  if ! command_exists acme.sh; then
-    curl -fsSL https://get.acme.sh | sh -s email="admin@${domain#*.}" --home "$ETC/acme"
+
+  # acme.sh 将程序目录与账户配置目录分开管理。必须显式固定两者，
+  # 否则 root 下会退回 /root/.acme.sh，造成安装目录与 account.conf 不一致。
+  mkdir -p "$ACME_HOME" "$ACME_CONFIG_HOME"
+  chmod 700 "$ACME_HOME" "$ACME_CONFIG_HOME"
+  local acme="$ACME_HOME/acme.sh"
+  if [[ ! -x "$acme" ]]; then
+    curl -fsSL https://get.acme.sh | sh -s --home "$ACME_HOME" --config-home "$ACME_CONFIG_HOME"
   fi
-  local acme="$ETC/acme/acme.sh"
-  [[ -x "$acme" ]] || die "acme.sh 安装失败"
-  "$acme" --set-default-ca --server letsencrypt >/dev/null
-  "$acme" --issue --standalone -d "$domain" --keylength ec-256 --httpport 80
+  [[ -x "$acme" ]] || die "acme.sh 安装失败：未找到 $acme"
+
+  # 显式指定 Let's Encrypt，并在每次调用时使用同一个 config-home，
+  # 不依赖 acme.sh 的 ZeroSSL 默认值，也不要求虚构邮箱地址。
+  "$acme" --home "$ACME_HOME" --config-home "$ACME_CONFIG_HOME" --set-default-ca --server letsencrypt >/dev/null
+  "$acme" --home "$ACME_HOME" --config-home "$ACME_CONFIG_HOME" \
+    --issue --server letsencrypt --standalone -d "$domain" --keylength ec-256 --httpport 80
   mkdir -p "$CERT_DIR"
-  "$acme" --install-cert -d "$domain" --ecc \
+  "$acme" --home "$ACME_HOME" --config-home "$ACME_CONFIG_HOME" \
+    --install-cert -d "$domain" --ecc \
     --key-file "$CERT_DIR/key.pem" \
     --fullchain-file "$CERT_DIR/cert.pem" \
     --reloadcmd "$(command -v true)"
@@ -156,7 +168,7 @@ issue_certificate(){
   [[ -s "$CERT_DIR/key.pem" && -s "$CERT_DIR/cert.pem" ]] || die "证书文件不存在或为空"
   if command_exists crontab; then
     (crontab -l 2>/dev/null | grep -v 'suoha-v2-acme-renew' || true
-     echo "17 3 * * * $acme --cron --home $ETC/acme >/dev/null 2>&1 && (systemctl restart suoha-v2 2>/dev/null || rc-service suoha-v2 restart 2>/dev/null || true) # suoha-v2-acme-renew") | crontab -
+     echo "17 3 * * * $acme --home $ACME_HOME --config-home $ACME_CONFIG_HOME --cron >/dev/null 2>&1 && (systemctl restart suoha-v2 2>/dev/null || rc-service suoha-v2 restart 2>/dev/null || true) # suoha-v2-acme-renew") | crontab -
   fi
 }
 
